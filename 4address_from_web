@@ -1,0 +1,168 @@
+import os
+import time
+import pandas as pd
+from typing import Optional, List
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from webdriver_manager.chrome import ChromeDriverManager
+
+
+class CompanyAddressScraper:
+    def __init__(self, headless: bool = True):
+        self.headless = headless
+
+    def make_driver(self):
+        options = Options()
+        if self.headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument(
+            "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.set_page_load_timeout(40)
+        return driver
+
+    def extract_address(self, cid: str) -> Optional[str]:
+        url = f"https://data.ggzy.gov.cn/#/company?id={cid}"
+        driver = None
+
+        try:
+            driver = self.make_driver()
+            wait = WebDriverWait(driver, 25)
+
+            driver.get(url)
+            time.sleep(4)
+
+            wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            body = driver.find_element(By.TAG_NAME, "body").text
+
+            # 先确认页面里已经有当前 cid
+            wait.until(lambda d: cid in d.find_element(By.TAG_NAME, "body").text)
+            time.sleep(1)
+
+            body = driver.find_element(By.TAG_NAME, "body").text
+            if cid not in body:
+                print(f"[WARN] CID {cid} 页面未切换成功")
+                return None
+
+            # 方案1：先从整页文本提取“住所”
+            lines = [x.strip() for x in body.splitlines() if x.strip()]
+            for i, line in enumerate(lines):
+                if line in ["住所", "住所："] and i + 1 < len(lines):
+                    addr = lines[i + 1].strip()
+                    if len(addr) > 5 and addr != cid:
+                        return addr
+                if line.startswith("住所："):
+                    addr = line.replace("住所：", "").strip()
+                    if len(addr) > 5 and addr != cid:
+                        return addr
+
+            # 方案2：找“住所”所在 span
+            label = wait.until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//span[contains(normalize-space(.), '住所')]")
+                )
+            )
+
+            # 方案2a：父容器下所有 span
+            try:
+                parent = label.find_element(By.XPATH, "./..")
+                spans = parent.find_elements(By.XPATH, ".//span")
+                texts = [s.text.strip() for s in spans if s.text.strip()]
+                texts = [t for t in texts if t not in ["住所", "住所："]]
+                for t in texts:
+                    if len(t) > 5 and t != cid:
+                        return t
+            except:
+                pass
+
+            # 方案2b：再往上一层
+            try:
+                parent2 = label.find_element(By.XPATH, "./../..")
+                spans = parent2.find_elements(By.XPATH, ".//span")
+                texts = [s.text.strip() for s in spans if s.text.strip()]
+                texts = [t for t in texts if t not in ["住所", "住所："]]
+                for t in texts:
+                    if len(t) > 5 and t != cid:
+                        return t
+            except:
+                pass
+
+            print(f"[WARN] CID {cid} 找到页面但未提取到真实住所")
+
+        except TimeoutException:
+            print(f"[WARN] CID {cid} 未渲染出真实住所")
+        except Exception as e:
+            print(f"[ERROR] CID {cid} 提取失败：{e}")
+
+        os.makedirs("debug", exist_ok=True)
+        if driver is not None:
+            try:
+                driver.save_screenshot(f"debug/{cid}.png")
+                with open(f"debug/{cid}.html", "w", encoding="utf-8") as f:
+                    f.write(driver.page_source)
+            except:
+                pass
+
+        return None
+
+        # finally 不能放在 return 后面，所以单独写
+    def scrape_from_csv(self, input_csv: str, output_csv: str):
+        df = pd.read_csv(input_csv, dtype=str).fillna("")
+
+        if "cid" not in df.columns:
+            raise ValueError("CSV 必须包含 cid 列")
+        if "name" not in df.columns:
+            raise ValueError("CSV 必须包含 name 列")
+
+        df["cid"] = df["cid"].astype(str).str.strip()
+        df["name"] = df["name"].astype(str).str.strip()
+
+        df_valid = df[(df["cid"] != "") & (df["cid"] != "未查到")].copy()
+
+        results: List[dict] = []
+        total = len(df_valid)
+
+        for i, (_, row) in enumerate(df_valid.iterrows(), start=1):
+            company_name = row["name"]
+            cid = row["cid"]
+
+            print(f"[{i}/{total}] 查询：{company_name} ({cid})")
+            address = self.extract_address(cid)
+
+            results.append({
+                "name": company_name,
+                "cid": cid,
+                "address": address
+            })
+
+            pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
+            time.sleep(2)
+
+        failed = [r for r in results if not r["address"]]
+        if failed:
+            failed_path = os.path.join(os.path.dirname(output_csv), "failed_cids.csv")
+            pd.DataFrame(failed).to_csv(failed_path, index=False, encoding="utf-8-sig")
+            print(f"❗ {len(failed)} 条未拿到地址，已写入 {failed_path}")
+
+        print(f"✅ 全部完成，结果已保存 → {output_csv}")
+
+
+if __name__ == "__main__":
+    input_csv = "/Users/mac/Desktop/tongbu/企业科研/yiji2026jiangsu/2cid对应数据/yijiplus_删除重复cid后.csv"
+    output_csv = "/Users/mac/Desktop/tongbu/企业科研/yiji2026jiangsu/2cid对应数据/company_real_addresses.csv"
+
+    scraper = CompanyAddressScraper(headless=True)
+    scraper.scrape_from_csv(input_csv, output_csv)
